@@ -4,10 +4,10 @@ import yfinance as yf
 import numpy as np
 
 # ==============================
-# 1. Descarga de la data
+# 1. Descargar Data
 # ==============================
 
-ticker = "BTC-USD"
+ticker = "MSFT"
 
 data = yf.download(
     ticker,
@@ -16,257 +16,161 @@ data = yf.download(
     auto_adjust=True
 )
 
-# Simplificar columnas MultiIndex si es necesario
 if isinstance(data.columns, pd.MultiIndex):
     data.columns = data.columns.get_level_values(0)
-    print("Simplified columns:", data.columns)
-
-# ==============================
-# 2. Retornos Diarios
-# ==============================
 
 data["Returns"] = data["Close"].pct_change()
 
-print("\nDaily Returns Summary:")
-print(data["Returns"].describe())
-
-print("\nFirst 5 rows:")
-print("-----------------------------------")
-print(data.head())
-print("-----------------------------------")
-print(data.info())
-
-print("\nMissing values per column:")
-print("-----------------------------------")
-print(data.isnull().sum())
-print("-----------------------------------")
-
 # ==============================
-# 3. Media Movil Simple (SMA)
+# 2. Train / Test Split
 # ==============================
 
-data["SMA_20"] = data["Close"].rolling(window=20).mean()
-data["SMA_50"] = data["Close"].rolling(window=50).mean()
-
-data["Signal"] = 0
-data.loc[data["SMA_20"] > data["SMA_50"], "Signal"] = 1
-
-data["Strategy_Returns"] = data["Signal"].shift(1) * data["Returns"]
+train = data.loc["2020-01-01":"2021-12-31"].copy()
+test = data.loc["2022-01-01":"2022-12-31"].copy()
 
 # ==============================
-# 4. Retornos Acumulados
+# 3. Backtest EMA + Momentum
 # ==============================
 
-data["Market_Cumulative"] = (1 + data["Returns"]).cumprod()
-data["Strategy_Cumulative"] = (1 + data["Strategy_Returns"]).cumprod()
-
-# ==============================
-# 5. Métricas de Rendimiento
-# ==============================
-
-# Daily stats
-market_daily_mean = data["Returns"].mean()
-strategy_daily_mean = data["Strategy_Returns"].mean()
-
-market_daily_vol = data["Returns"].std()
-strategy_daily_vol = data["Strategy_Returns"].std()
-
-# Annualized return
-market_annual_return = (1 + market_daily_mean) ** 252 - 1
-strategy_annual_return = (1 + strategy_daily_mean) ** 252 - 1
-
-# Annualized volatility
-market_annual_vol = market_daily_vol * np.sqrt(252)
-strategy_annual_vol = strategy_daily_vol * np.sqrt(252)
-
-# Sharpe ratio (risk-free rate assumed 0)
-market_sharpe = market_annual_return / market_annual_vol
-strategy_sharpe = strategy_annual_return / strategy_annual_vol
-
-print("=== MARKET ===")
-print(f"Annual Return: {market_annual_return:.4f}")
-print(f"Annual Volatility: {market_annual_vol:.4f}")
-print(f"Sharpe Ratio: {market_sharpe:.4f}")
-
-print("\n=== STRATEGY ===")
-print(f"Annual Return: {strategy_annual_return:.4f}")
-print(f"Annual Volatility: {strategy_annual_vol:.4f}")
-print(f"Sharpe Ratio: {strategy_sharpe:.4f}")
-
-# ==============================
-# 6. Max Drawdown
-# ==============================
-
-market_rolling_max = data["Market_Cumulative"].cummax()
-market_drawdown = data["Market_Cumulative"] / market_rolling_max - 1
-market_max_dd = market_drawdown.min()
-
-strategy_rolling_max = data["Strategy_Cumulative"].cummax()
-strategy_drawdown = data["Strategy_Cumulative"] / strategy_rolling_max - 1
-strategy_max_dd = strategy_drawdown.min()
-
-print(f"\nMarket Max Drawdown: {market_max_dd:.4f}")
-print(f"Strategy Max Drawdown: {strategy_max_dd:.4f}")
-
-# Return / Max Drawdown ratio
-market_return_dd_ratio = market_annual_return / abs(market_max_dd)
-strategy_return_dd_ratio = strategy_annual_return / abs(strategy_max_dd)
-
-print(f"\nReturn / MaxDD Market: {market_return_dd_ratio:.4f}")
-print(f"Return / MaxDD Strategy: {strategy_return_dd_ratio:.4f}")
-
-# ==============================
-# 7. Reusable Backtest Function
-# ==============================
-
-def backtest_sma(data, short_window, long_window):
+def backtest_ema_momentum(data, short_window, long_window, momentum_window):
 
     df = data.copy()
 
-    short_window = max(1, int(short_window))
-    long_window = max(1, int(long_window))
-
-    df["SMA_short"] = df["Close"].rolling(window=short_window).mean()
-    df["SMA_long"] = df["Close"].rolling(window=long_window).mean()
+    df["EMA_short"] = df["Close"].ewm(span=short_window, adjust=False).mean()
+    df["EMA_long"] = df["Close"].ewm(span=long_window, adjust=False).mean()
+    df["Momentum"] = df["Close"].pct_change(momentum_window)
 
     df["Signal"] = 0
-    df.loc[df["SMA_short"] > df["SMA_long"], "Signal"] = 1
+    df.loc[
+        (df["EMA_short"] > df["EMA_long"]) &
+        (df["Momentum"] > 0),
+        "Signal"
+    ] = 1
 
     df["Strategy_Returns"] = df["Signal"].shift(1) * df["Returns"]
 
+    df["Market_Cumulative"] = (1 + df["Returns"]).cumprod()
+    df["Strategy_Cumulative"] = (1 + df["Strategy_Returns"]).cumprod()
+
+    # Annual metrics
     mean_return = df["Strategy_Returns"].mean()
     vol = df["Strategy_Returns"].std()
 
     annual_return = (1 + mean_return) ** 252 - 1
     annual_vol = vol * np.sqrt(252)
-
     sharpe = annual_return / annual_vol if annual_vol != 0 else 0
 
-    return annual_return, annual_vol, sharpe
+    # Max Drawdown
+    roll_max = df["Strategy_Cumulative"].cummax()
+    drawdown = df["Strategy_Cumulative"] / roll_max - 1
+    max_dd = drawdown.min()
+
+    return annual_return, annual_vol, sharpe, max_dd, df
 
 # ==============================
-# 8. Train / Test Split
+# 4. Optimización SOLO en TRAIN
 # ==============================
-
-train = data.loc["2020-01-01":"2022-12-31"]
-test = data.loc["2023-01-01":"2023-12-31"]
-
-# ==============================
-# 9. Parameter Optimization (Grid Search)
-# ==============================
-
-results = []
 
 short_range = range(5, 31, 5)
 long_range = range(40, 201, 20)
+momentum_range = [30, 60, 90, 120]
+
+results = []
 
 for short_window in short_range:
     for long_window in long_range:
+        for momentum_window in momentum_range:
 
-        if short_window < long_window:
+            if short_window < long_window:
 
-            annual_return, annual_vol, sharpe = backtest_sma(
-                data, short_window, long_window
-            )
+                annual_return, annual_vol, sharpe, max_dd, _ = backtest_ema_momentum(
+                    train,
+                    short_window,
+                    long_window,
+                    momentum_window
+                )
 
-            results.append({
-                "short_window": short_window,
-                "long_window": long_window,
-                "annual_return": annual_return,
-                "annual_vol": annual_vol,
-                "sharpe": sharpe
-            })
+                results.append({
+                    "short": short_window,
+                    "long": long_window,
+                    "momentum": momentum_window,
+                    "return": annual_return,
+                    "vol": annual_vol,
+                    "sharpe": sharpe,
+                    "max_dd": max_dd
+                })
 
-results_df = pd.DataFrame(results)
-results_df = results_df.sort_values(by="sharpe", ascending=False)
+results_df = pd.DataFrame(results).sort_values(by="sharpe", ascending=False)
 
-print("\nTop 10 Parameter Combinations:")
-print(results_df.head(10))
-
-
-# ==============================
-# 10. Optimization on TRAIN only
-# ==============================
-
-train_results = []
-
-for short_window in short_range:
-    for long_window in long_range:
-
-        if short_window < long_window:
-
-            annual_return, annual_vol, sharpe = backtest_sma(
-                train, short_window, long_window
-            )
-
-            train_results.append({
-                "short_window": short_window,
-                "long_window": long_window,
-                "annual_return": annual_return,
-                "annual_vol": annual_vol,
-                "sharpe": sharpe
-            })
-
-train_results_df = pd.DataFrame(train_results)
-train_results_df = train_results_df.sort_values(by="sharpe", ascending=False)
-
-print("\nTop 5 TRAIN combinations:")
-print(train_results_df.head())
+print("\nTop 5 TRAIN combinations (EMA + Momentum):")
+print(results_df.head())
 
 # ==============================
-# 10.1 Select Best Combination
+# 5. Seleccionar Mejor Parámetro
 # ==============================
 
-best_short = train_results_df.iloc[0]["short_window"]
-best_long = train_results_df.iloc[0]["long_window"]
+best = results_df.iloc[0]
 
-print(f"\nBest parameters from TRAIN:")
-print(f"Short Window: {best_short}")
-print(f"Long Window: {best_long}")
+best_short = int(best["short"])
+best_long = int(best["long"])
+best_momentum = int(best["momentum"])
 
+print("\nBest Parameters from TRAIN:")
+print(f"Short: {best_short}")
+print(f"Long: {best_long}")
+print(f"Momentum: {best_momentum}")
 
 # ==============================
-# 11. Evaluation on TEST
+# 6. Evaluación en TEST
 # ==============================
 
-test_return, test_vol, test_sharpe = backtest_sma(
-    test, best_short, best_long
+test_return, test_vol, test_sharpe, test_dd, test_df = backtest_ema_momentum(
+    test,
+    best_short,
+    best_long,
+    best_momentum
 )
 
-print("\n=== TEST PERFORMANCE (Out-of-Sample) ===")
-print(f"Annual Return: {test_return:.4f}")
-print(f"Annual Volatility: {test_vol:.4f}")
-print(f"Sharpe Ratio: {test_sharpe:.4f}")
-
-
-# ==============================
-# 12. Buy & Hold Performance in TEST
-# ==============================
-
-# Daily stats (TEST only)
-test_market_daily_mean = test["Returns"].mean()
-test_market_daily_vol = test["Returns"].std()
-
-# Annualized metrics
-test_market_annual_return = (1 + test_market_daily_mean) ** 252 - 1
-test_market_annual_vol = test_market_daily_vol * np.sqrt(252)
-
-test_market_sharpe = test_market_annual_return / test_market_annual_vol
-
-print("\n=== BUY & HOLD (TEST 2023) ===")
-print(f"Annual Return: {test_market_annual_return:.4f}")
-print(f"Annual Volatility: {test_market_annual_vol:.4f}")
-print(f"Sharpe Ratio: {test_market_sharpe:.4f}")
-
-# ==============================
-# 12.1 Comparación directa
-# - Buscamos:
-#   Estrategia > Mercado = Generamos alpha real
-#   Similar = Quizas no agregamos valor, pero reducimos riesgo tal vez
-#   Mercado > Estrategia = La estrategia no es rentable o no agrega valor en este periodo
-# ==============================
-
-print("\n=== COMPARISON (TEST) ===")
+print("\n=== TEST PERFORMANCE (2022) ===")
+print(f"Strategy Return: {test_return:.4f}")
+print(f"Strategy Volatility: {test_vol:.4f}")
 print(f"Strategy Sharpe: {test_sharpe:.4f}")
-print(f"Market Sharpe:   {test_market_sharpe:.4f}")
-print(f"Sharpe Difference: {test_sharpe - test_market_sharpe:.4f}")
+print(f"Strategy MaxDD: {test_dd:.4f}")
+
+# ==============================
+# 7. Buy & Hold en TEST
+# ==============================
+
+mean_market = test["Returns"].mean()
+vol_market = test["Returns"].std()
+
+market_return = (1 + mean_market) ** 252 - 1
+market_vol = vol_market * np.sqrt(252)
+market_sharpe = market_return / market_vol
+
+market_cum = (1 + test["Returns"]).cumprod()
+market_roll = market_cum.cummax()
+market_dd = (market_cum / market_roll - 1).min()
+
+print("\n=== BUY & HOLD (2022) ===")
+print(f"Market Return: {market_return:.4f}")
+print(f"Market Volatility: {market_vol:.4f}")
+print(f"Market Sharpe: {market_sharpe:.4f}")
+print(f"Market MaxDD: {market_dd:.4f}")
+
+print("\n=== COMPARISON ===")
+print(f"Sharpe Difference: {test_sharpe - market_sharpe:.4f}")
+print(f"Return Difference: {test_return - market_return:.4f}")
+print(f"MaxDD Difference: {test_dd - market_dd:.4f}")
+
+# ==============================
+# 8. Gráfico TEST
+# ==============================
+
+plt.figure(figsize=(10,6))
+plt.plot(test_df["Market_Cumulative"], label="Buy & Hold")
+plt.plot(test_df["Strategy_Cumulative"], label="EMA + Momentum")
+plt.title(f"{ticker} - TEST 2022")
+plt.legend()
+plt.grid(True)
+plt.show()
